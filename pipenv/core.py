@@ -1536,6 +1536,7 @@ def format_help(help):
     help = help.replace("  sync", str(crayons.green("  sync", bold=True)))
     help = help.replace("  uninstall", str(crayons.magenta("  uninstall", bold=True)))
     help = help.replace("  update", str(crayons.green("  update", bold=True)))
+    help = help.replace("  maketest", str(crayons.cyan("  maketest", bold=True)))
     additional_help = """
 Usage Examples:
    Create a new project using Python 3.7, specifically:

@@ -8,6 +8,7 @@ from click import (
     BadParameter, Group, Option, argument, echo, make_pass_decorator, option
 )
 
+from .developer import add_developer_options
 from .. import environments
 from ..utils import is_valid_url
 
@@ -298,6 +299,15 @@ def deploy_option(f):
     return option("--deploy", is_flag=True, default=False, type=click_booltype,
                     help=u"Abort if the Pipfile.lock is out-of-date, or Python version is"
                             " wrong.", callback=callback, expose_value=False)(f)
+
+
+def developer_option(f):
+    def callback(ctx, param, value):
+        if value:
+            add_developer_options(ctx.command)
+        return value
+    return option("--developer", default=False, is_flag=True, expose_value=False, is_eager=True,
+                  help="Enable developer options (--developer --help to list).", callback=callback)(f)
 
 
 def setup_verbosity(ctx, param, value):

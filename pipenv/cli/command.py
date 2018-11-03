@@ -19,6 +19,7 @@ from .. import environments
 from ..__version__ import __version__
 from .options import (
     CONTEXT_SETTINGS, PipenvGroup, code_option, common_options, deploy_option,
+    developer_option,
     general_options, install_options, lock_options, pass_state, skip_lock_option,
     pypi_mirror_option, python_option, requirementstxt_option, sync_options,
     system_option, three_option, verbose_option, uninstall_options
@@ -52,6 +53,7 @@ click_completion.init()
     is_flag=True,
     help="Output diagnostic information for use in GitHub issues.",
 )
+@developer_option
 @general_options
 @version_option(prog_name=crayons.normal("pipenv", bold=True), version=__version__)
 @pass_state
