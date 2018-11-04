@@ -20,6 +20,7 @@ six.add_move(six.MovedAttribute("Mapping", "collections", "collections.abc"))
 from six.moves import Mapping
 
 from vistir.compat import ResourceWarning
+# from .jjc import FakeRepository
 
 try:
     from weakref import finalize
@@ -201,109 +202,12 @@ def prepare_pip_source_args(sources, pip_args=None):
     return pip_args
 
 
-def actually_resolve_deps(
-    deps,
-    index_lookup,
-    markers_lookup,
-    project,
-    sources,
-    clear,
-    pre,
-    req_dir=None,
-):
-    from .vendor.pip_shims.shims import (
-        Command, parse_requirements, DistributionNotFound
-    )
-    from .vendor.requests.exceptions import HTTPError
-    from pipenv.patched.piptools.resolver import Resolver
-    from pipenv.patched.piptools.repositories.pypi import PyPIRepository
-    from pipenv.patched.piptools.scripts.compile import get_pip_command
-    from pipenv.patched.piptools import logging as piptools_logging
+def _invoke_resolve(resolver, hashes):
     from pipenv.patched.piptools.exceptions import NoCandidateFound
-    from .vendor.requirementslib.models.requirements import Requirement
-    from .vendor.vistir.path import (
-        create_tracked_tempdir, create_tracked_tempfile, url_to_path,
-    )
-    from .vendor.vistir.compat import Path, to_native_string
+    from .vendor.requests.exceptions import HTTPError
+    from .vendor.pip_shims.shims import DistributionNotFound
 
-    class PipCommand(Command):
-        """Needed for pip-tools."""
-
-        name = "PipCommand"
-
-    constraints = []
-    needs_hash = []
-    if not req_dir:
-        req_dir = create_tracked_tempdir(suffix="-requirements", prefix="pipenv-")
-    for dep in deps:
-        if not dep:
-            continue
-        url = None
-        indexes, trusted_hosts, remainder = parse_indexes(dep)
-        if indexes:
-            url = indexes[0]
-        dep = " ".join(remainder)
-        req = Requirement.from_line(dep)
-        new_ireq = req.as_ireq()
-        if getattr(new_ireq, "link", None) and new_ireq.link.is_wheel and new_ireq.link.scheme == 'file':
-            needs_hash.append(new_ireq)
-
-        # extra_constraints = []
-
-        if url:
-            index_lookup[req.name] = project.get_source(url=url).get("name")
-        # strip the marker and re-add it later after resolution
-        # but we will need a fallback in case resolution fails
-        # eg pypiwin32
-        if req.markers:
-            markers_lookup[req.name] = req.markers.replace('"', "'")
-        constraints.append(req.constraint_line)
-
-    pip_command = get_pip_command()
-    constraints_file = None
-    pip_args = []
-    if sources:
-        pip_args = prepare_pip_source_args(sources, pip_args)
-    if environments.is_verbose():
-        click_echo(crayons.blue("Using pip: {0}".format(" ".join(pip_args))), err=True)
-    constraints_file = create_tracked_tempfile(
-        mode="w",
-        prefix="pipenv-",
-        suffix="-constraints.txt",
-        dir=req_dir,
-        delete=False,
-    )
-    if sources:
-        requirementstxt_sources = " ".join(pip_args) if pip_args else ""
-        requirementstxt_sources = requirementstxt_sources.replace(" --", "\n--")
-    constraints_file.write(u"{0}\n".format(requirementstxt_sources))
-    constraints_file.write(u"\n".join([_constraint for _constraint in constraints]))
-    constraints_file.close()
-    pip_options, _ = pip_command.parser.parse_args(pip_args)
-    pip_options.cache_dir = environments.PIPENV_CACHE_DIR
-    session = pip_command._build_session(pip_options)
-    pypi = PyPIRepository(pip_options=pip_options, use_json=False, session=session)
-    constraints = parse_requirements(
-        constraints_file.name, finder=pypi.finder, session=pypi.session, options=pip_options
-    )
-    constraints = [c for c in constraints]
-    if environments.is_verbose():
-        logging.log.verbose = True
-        piptools_logging.log.verbose = True
     resolved_tree = set()
-    resolver = Resolver(
-        constraints=constraints, repository=pypi, clear_caches=clear, prereleases=pre
-    )
-    # pre-resolve instead of iterating to avoid asking pypi for hashes of editable packages
-    hashes = {
-        ireq: pypi._hash_cache.get_hash(ireq.link)
-        for ireq in constraints if (getattr(ireq, "link", None)
-        # We can only hash artifacts, but we don't want normal pypi artifcats since the
-        # normal resolver handles those
-        and ireq.link.is_artifact and not (is_pypi_url(ireq.link.url) or
-        # We also don't want to try to hash directories as this will fail (editable deps)
-        (ireq.link.scheme == "file" and Path(to_native_string(url_to_path(ireq.link.url))).is_dir())))
-    }
     try:
         results = resolver.resolve(max_rounds=environments.PIPENV_MAX_ROUNDS)
         resolved_tree.update(results)
@@ -337,7 +241,140 @@ def actually_resolve_deps(
         for ireq, ireq_hashes in resolved_hashes.items():
             if ireq not in hashes:
                 hashes[ireq] = ireq_hashes
-    return (resolved_tree, hashes, markers_lookup, resolver)
+    return resolved_tree
+
+
+def _hash_now_not_in_resolver(ireq):
+    from .vendor.vistir.compat import Path, to_native_string
+    from .vendor.vistir.path import url_to_path
+
+    if not getattr(ireq, "link", None):
+        return False
+
+    # We can only hash artifacts
+    if not ireq.link.is_artifact:
+        return False
+
+    # we don't want normal pypi artifcats since the normal resolver handles those
+    if is_pypi_url(ireq.link.url):
+        return False
+
+    # We also don't want to try to hash directories as this will fail (editable deps)
+    if ireq.link.scheme == "file" and Path(to_native_string(url_to_path(ireq.link.url))).is_dir():
+        return False
+
+    return True
+
+
+def actually_process_deps(
+    deps,
+    index_lookup,
+    markers_lookup,
+    project,
+    sources,
+    clear,
+    pre,
+    process="resolve",
+    req_dir=None,
+):
+    """Either resolve (default) or fetch dependencies.
+
+    In resolve mode use (a patched) piptools.resolver.Resolver
+
+    In fetch mode recursively expand all possible dependencies
+    (not just the ones we end up choosing).
+    """
+    from pipenv.patched.piptools.resolver import Resolver
+    from pipenv.patched.piptools.repositories.pypi import PyPIRepository
+    from pipenv.patched.piptools.scripts.compile import get_pip_command
+    from pipenv.patched.piptools import logging as piptools_logging
+    from .vendor.requirementslib.models.requirements import Requirement
+    from .vendor.vistir.path import (
+        create_tracked_tempdir, create_tracked_tempfile,
+    )
+    from .vendor.pip_shims.shims import parse_requirements
+
+    assert process in ("resolve", "fetch")
+
+    constraints = []
+    needs_hash = []
+    if not req_dir:
+        req_dir = create_tracked_tempdir(suffix="-requirements", prefix="pipenv-")
+    for dep in deps:
+        if not dep:
+            continue
+        url = None
+        indexes, trusted_hosts, remainder = parse_indexes(dep)
+        if indexes:
+            url = indexes[0]
+        dep = " ".join(remainder)
+        req = Requirement.from_line(dep)
+        new_ireq = req.as_ireq()
+        if getattr(new_ireq, "link", None) and new_ireq.link.is_wheel and new_ireq.link.scheme == 'file':
+            needs_hash.append(new_ireq)
+
+        # extra_constraints = []
+
+        if url:
+            index_lookup[req.name] = project.get_source(url=url).get("name")
+        # strip the marker and re-add it later after resolution
+        # but we will need a fallback in case resolution fails
+        # eg pypiwin32
+        if req.markers:
+            markers_lookup[req.name] = req.markers.replace('"', "'")
+        constraints.append(req.constraint_line)
+
+    pip_command = get_pip_command()
+    pip_args = []
+
+
+    constraints_file = create_tracked_tempfile(
+        mode="w",
+        prefix="pipenv-",
+        suffix="-constraints.txt",
+        dir=req_dir,
+        delete=False,
+    )
+    if sources:
+        pip_args = prepare_pip_source_args(sources, pip_args)
+        requirementstxt_sources = " ".join(pip_args) if pip_args else ""
+        requirementstxt_sources = requirementstxt_sources.replace(" --", "\n--")
+
+    if environments.is_verbose():
+        click_echo(crayons.blue("Using pip: {0}".format(" ".join(pip_args))), err=True)
+
+    constraints_file.write(u"{0}\n".format(requirementstxt_sources))
+    constraints_file.write(u"\n".join([_constraint for _constraint in constraints]))
+    constraints_file.close()
+    pip_options, _ = pip_command.parser.parse_args(pip_args)
+    pip_options.cache_dir = environments.PIPENV_CACHE_DIR
+    session = pip_command._build_session(pip_options)
+    pypi = PyPIRepository(pip_options=pip_options, use_json=False, session=session)
+    # pypi = FakeRepository(PyPIRepository(pip_options=pip_options, use_json=False, session=session))
+    constraints = parse_requirements(
+        constraints_file.name, finder=pypi.finder, session=pypi.session, options=pip_options
+    )
+    constraints = [c for c in constraints]
+    if environments.is_verbose():
+        logging.log.verbose = True
+        piptools_logging.log.verbose = True
+    resolver = Resolver(
+        constraints=constraints, repository=pypi, clear_caches=clear, prereleases=pre
+    )
+    # pre-resolve instead of iterating to avoid asking pypi for hashes of editable packages
+    hashes = {
+        ireq: pypi._hash_cache.get_hash(ireq.link)
+        for ireq in constraints
+        if _hash_now_not_in_resolver(ireq)
+    }
+    if process == 'resolve':
+        resolved_tree = _invoke_resolve(resolver, hashes)
+    elif process == 'fetch':
+        resolved_tree = set()
+        raise NotImplementedError('fetch')
+    else:
+        raise AssertionError("Bad argument process=%s" % process)
+    return resolved_tree, hashes, markers_lookup, resolver
 
 
 def venv_resolve_deps(
@@ -362,6 +399,9 @@ def venv_resolve_deps(
 
     if not deps:
         return []
+
+    import pdb
+    pdb.set_trace()
 
     req_dir = create_tracked_tempdir(prefix="pipenv", suffix="requirements")
     cmd = [
@@ -446,9 +486,13 @@ def resolve_deps(
 
     index_lookup = {}
     markers_lookup = {}
+    # `allow_global` is ignored here.
     python_path = which("python", allow_global=allow_global)
     if not os.environ.get("PIP_SRC"):
         os.environ["PIP_SRC"] = project.virtualenv_src_location
+    # Note: `which` in the only call to this method is a method
+    # that reurns sys.executable, so that
+    # `backup_python_path` and `python_path` are the same.
     backup_python_path = sys.executable
     results = []
     if not deps:
@@ -460,7 +504,7 @@ def resolve_deps(
         req_dir = create_tracked_tempdir(prefix="pipenv-", suffix="-requirements")
     with HackedPythonVersion(python_version=python, python_path=python_path):
         try:
-            resolved_tree, hashes, markers_lookup, resolver = actually_resolve_deps(
+            resolved_tree, hashes, markers_lookup, resolver = actually_process_deps(
                 deps,
                 index_lookup,
                 markers_lookup,
@@ -482,7 +526,7 @@ def resolve_deps(
             try:
                 # Attempt to resolve again, with different Python version information,
                 # particularly for particularly particular packages.
-                resolved_tree, hashes, markers_lookup, resolver = actually_resolve_deps(
+                resolved_tree, hashes, markers_lookup, resolver = actually_process_deps(
                     deps,
                     index_lookup,
                     markers_lookup,
