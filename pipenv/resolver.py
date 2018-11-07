@@ -15,109 +15,101 @@ def _patch_path():
         sys.path.insert(0, os.path.join(pipenv_libdir, _dir))
 
 
-def get_parser():
-    from argparse import ArgumentParser
-    parser = ArgumentParser("pipenv-resolver")
-    parser.add_argument("--pre", action="store_true", default=False)
-    parser.add_argument("--clear", action="store_true", default=False)
-    parser.add_argument("--verbose", "-v", action="count", default=False)
-    parser.add_argument("--debug", action="store_true", default=False)
-    parser.add_argument("--system", action="store_true", default=False)
-    parser.add_argument("--fetch", action="store_true", default=False)
-    parser.add_argument("--requirements-dir", metavar="requirements_dir", action="store",
-                        default=os.environ.get("PIPENV_REQ_DIR"))
-    parser.add_argument("packages", nargs="*")
-    return parser
-
-
 def which(*args, **kwargs):
+    # Note, unclear why using this one rather than pipenv.core.which
     return sys.executable
 
 
-def handle_parsed_args(parsed):
-    if parsed.debug:
-        parsed.verbose = max(parsed.verbose, 2)
-    if parsed.verbose > 1:
-        logging.getLogger("notpip").setLevel(logging.DEBUG)
-    elif parsed.verbose > 0:
-        logging.getLogger("notpip").setLevel(logging.INFO)
-    if "PIPENV_PACKAGES" in os.environ:
-        parsed.packages += os.environ.get("PIPENV_PACKAGES", "").strip().split("\n")
-    return parsed
+class ResolverCli(object):
+    """This class sets up the environment etc, for invoking pip via entry points in
+    pipenv.utils"""
+    NAME = "pipenv-resolver"
+
+    def __init__(self):
+        _patch_path()
+        from pipenv.vendor import colorama
+        from pipenv.core import project
+        colorama.init()
+        self.project = project
+        self.parsed = None
+
+    def get_parser(self):
+        from argparse import ArgumentParser
+        parser = ArgumentParser(self.NAME)
+        parser.add_argument("--pre", action="store_true", default=False)
+        parser.add_argument("--clear", action="store_true", default=False)
+        parser.add_argument("--verbose", "-v", action="count", default=False)
+        parser.add_argument("--debug", action="store_true", default=False)
+        parser.add_argument("--system", action="store_true", default=False)
+        parser.add_argument("--requirements-dir", metavar="requirements_dir", action="store",
+                            default=os.environ.get("PIPENV_REQ_DIR"))
+        parser.add_argument("packages", nargs="*")
+        return parser
+
+    def handle_parsed_args(self, parsed):
+        if parsed.debug:
+            parsed.verbose = max(parsed.verbose, 2)
+        if parsed.verbose > 1:
+            logging.getLogger("notpip").setLevel(logging.DEBUG)
+        elif parsed.verbose > 0:
+            logging.getLogger("notpip").setLevel(logging.INFO)
+        if "PIPENV_PACKAGES" in os.environ:
+            parsed.packages += os.environ.get("PIPENV_PACKAGES", "").strip().split("\n")
+        return parsed
+
+    def main(self):
+        import warnings
+        from pipenv.vendor.vistir.compat import ResourceWarning
+        warnings.simplefilter("ignore", category=ResourceWarning)
+        import io
+        import six
+        if six.PY3:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer,encoding='utf8')
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer,encoding='utf8')
+        else:
+            from pipenv._compat import force_encoding
+            force_encoding()
+
+        os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = str("1")
+        os.environ["PYTHONIOENCODING"] = str("utf-8")
+        os.environ["PIP_PYTHON_VERSION"] = ".".join([str(s) for s in sys.version_info[:3]])
+        os.environ["PIP_PYTHON_PATH"] = str(sys.executable)
+
+        parser = self.get_parser()
+        parsed, remaining = parser.parse_known_args()
+        # sys.argv = remaining
+        self.parsed = self.handle_parsed_args(parsed)
+
+        self.run(self.get_sources())
 
 
-def _main(pre, clear, verbose, system, fetch, requirements_dir, packages):
-    os.environ["PIP_PYTHON_VERSION"] = ".".join([str(s) for s in sys.version_info[:3]])
-    os.environ["PIP_PYTHON_PATH"] = str(sys.executable)
+    def get_sources(self):
+        from pipenv.utils import create_mirror_source, replace_pypi_sources
 
-    from pipenv.utils import create_mirror_source, process_deps, replace_pypi_sources
+        if "PIPENV_PYPI_MIRROR" in os.environ:
+            pypi_mirror_source = create_mirror_source(os.environ["PIPENV_PYPI_MIRROR"])
+            return replace_pypi_sources(self.project.pipfile_sources, pypi_mirror_source)
+        else:
+            return self.project.pipfile_sources
 
-    pypi_mirror_source = (
-        create_mirror_source(os.environ["PIPENV_PYPI_MIRROR"])
-        if "PIPENV_PYPI_MIRROR" in os.environ
-        else None
-    )
-
-    def resolve(packages, pre, project, sources, clear, system, requirements_dir=None):
-        return process_deps(
-            packages,
-            which,
-            project=project,
-            pre=pre,
-            sources=sources,
-            clear=clear,
-            allow_global=system,
-            process='fetch' if fetch else 'resolve',
-            req_dir=requirements_dir
-        )
-
-    from pipenv.core import project
-    sources = (
-        replace_pypi_sources(project.pipfile_sources, pypi_mirror_source)
-        if pypi_mirror_source
-        else project.pipfile_sources
-    )
-    results = resolve(
-        packages,
-        pre=pre,
-        project=project,
-        sources=sources,
-        clear=clear,
-        system=system,
-        requirements_dir=requirements_dir,
-    )
-    print("RESULTS:")
-    if results:
-        print(json.dumps(results))
-    else:
-        print(json.dumps([]))
-
-
-def main():
-    _patch_path()
-    import warnings
-    from pipenv.vendor.vistir.compat import ResourceWarning
-    warnings.simplefilter("ignore", category=ResourceWarning)
-    import io
-    import six
-    if six.PY3:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer,encoding='utf8')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer,encoding='utf8')
-    else:
-        from pipenv._compat import force_encoding
-        force_encoding()
-    os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = str("1")
-    os.environ["PYTHONIOENCODING"] = str("utf-8")
-    parser = get_parser()
-    parsed, remaining = parser.parse_known_args()
-    # sys.argv = remaining
-    parsed = handle_parsed_args(parsed)
-    _main(parsed.pre, parsed.clear, parsed.verbose, parsed.system,
-          parsed.fetch, parsed.requirements_dir, parsed.packages)
+    def run(self, sources):
+        from pipenv.utils import resolve_deps
+        results = resolve_deps(
+                self.parsed.packages,
+                which,
+                project=self.project,
+                pre=self.parsed.pre,
+                sources=sources,
+                clear=self.parsed.clear,
+                allow_global=self.parsed.system,
+                req_dir=self.parsed.requirements_dir
+            )
+        print("RESULTS:")
+        if results:
+            print(json.dumps(results))
+        else:
+            print(json.dumps([]))
 
 
 if __name__ == "__main__":
-    _patch_path()
-    from pipenv.vendor import colorama
-    colorama.init()
-    main()
+    ResolverCli().main()
