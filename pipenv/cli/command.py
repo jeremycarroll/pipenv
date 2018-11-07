@@ -100,12 +100,12 @@ def cli(
         warn_in_virtualenv,
         do_where,
         project,
-        spinner,
         cleanup_virtualenv,
         ensure_project,
         format_help,
         do_clear,
     )
+    from ..utils import create_spinner
 
     if man:
         if system_which("man"):
@@ -181,7 +181,7 @@ def cli(
                         )
                     )
                 )
-                with spinner():
+                with create_spinner(text="Running..."):
                     # Remove the virtualenv.
                     cleanup_virtualenv(bare=True)
                 return 0
@@ -255,7 +255,7 @@ def install(
 
 
 @cli.command(short_help="Un-installs a provided package and removes it from Pipfile.")
-@option("--lock", is_flag=True, default=True, help="Lock afterwards.")
+@option("--skip-lock/--lock", is_flag=True, default=False, help="Lock afterwards.")
 @option(
     "--all-dev",
     is_flag=True,
@@ -274,7 +274,7 @@ def install(
 def uninstall(
     ctx,
     state,
-    lock=False,
+    skip_lock=False,
     all_dev=False,
     all=False,
     **kwargs
@@ -288,7 +288,7 @@ def uninstall(
         three=state.three,
         python=state.python,
         system=state.system,
-        lock=lock,
+        lock=not skip_lock,
         all_dev=all_dev,
         all=all,
         keep_outdated=state.installstate.keep_outdated,
@@ -314,8 +314,12 @@ def lock(
     # Ensure that virtualenv is available.
     ensure_project(three=state.three, python=state.python, pypi_mirror=state.pypi_mirror)
     if state.installstate.requirementstxt:
-        do_init(dev=state.installstate.dev, requirements=state.installstate.requirementstxt,
-                        pypi_mirror=state.pypi_mirror, pre=state.installstate.pre)
+        do_init(
+            dev=state.installstate.dev,
+            requirements=state.installstate.requirementstxt,
+            pypi_mirror=state.pypi_mirror,
+            pre=state.installstate.pre,
+        )
     do_lock(
         ctx=ctx,
         clear=state.clear,
@@ -551,8 +555,10 @@ def run_open(state, module, *args, **kwargs):
     from ..core import which, ensure_project
 
     # Ensure that virtualenv is available.
-    ensure_project(three=state.three, python=state.python, validate=False,
-                        pypi_mirror=state.pypi_mirror)
+    ensure_project(
+        three=state.three, python=state.python,
+        validate=False, pypi_mirror=state.pypi_mirror,
+    )
     c = delegator.run(
         '{0} -c "import {1}; print({1}.__file__);"'.format(which("python"), module)
     )
