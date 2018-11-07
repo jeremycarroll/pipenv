@@ -23,8 +23,9 @@ def get_parser():
     parser.add_argument("--verbose", "-v", action="count", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--system", action="store_true", default=False)
+    parser.add_argument("--fetch", action="store_true", default=False)
     parser.add_argument("--requirements-dir", metavar="requirements_dir", action="store",
-                            default=os.environ.get("PIPENV_REQ_DIR"))
+                        default=os.environ.get("PIPENV_REQ_DIR"))
     parser.add_argument("packages", nargs="*")
     return parser
 
@@ -45,11 +46,11 @@ def handle_parsed_args(parsed):
     return parsed
 
 
-def _main(pre, clear, verbose, system, requirements_dir, packages):
+def _main(pre, clear, verbose, system, fetch, requirements_dir, packages):
     os.environ["PIP_PYTHON_VERSION"] = ".".join([str(s) for s in sys.version_info[:3]])
     os.environ["PIP_PYTHON_PATH"] = str(sys.executable)
 
-    from pipenv.utils import create_mirror_source, resolve_deps, replace_pypi_sources
+    from pipenv.utils import create_mirror_source, process_deps, replace_pypi_sources
 
     pypi_mirror_source = (
         create_mirror_source(os.environ["PIPENV_PYPI_MIRROR"])
@@ -58,7 +59,7 @@ def _main(pre, clear, verbose, system, requirements_dir, packages):
     )
 
     def resolve(packages, pre, project, sources, clear, system, requirements_dir=None):
-        return resolve_deps(
+        return process_deps(
             packages,
             which,
             project=project,
@@ -66,6 +67,7 @@ def _main(pre, clear, verbose, system, requirements_dir, packages):
             sources=sources,
             clear=clear,
             allow_global=system,
+            process='fetch' if fetch else 'resolve',
             req_dir=requirements_dir
         )
 
@@ -111,7 +113,7 @@ def main():
     # sys.argv = remaining
     parsed = handle_parsed_args(parsed)
     _main(parsed.pre, parsed.clear, parsed.verbose, parsed.system,
-             parsed.requirements_dir, parsed.packages)
+          parsed.fetch, parsed.requirements_dir, parsed.packages)
 
 
 if __name__ == "__main__":

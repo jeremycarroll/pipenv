@@ -371,6 +371,7 @@ def actually_process_deps(
         resolved_tree = _invoke_resolve(resolver, hashes)
     elif process == 'fetch':
         resolved_tree = set()
+        print('XXX')
         raise NotImplementedError('fetch')
     else:
         raise AssertionError("Bad argument process=%s" % process)
@@ -467,7 +468,7 @@ def venv_resolve_deps(
         raise RuntimeError("There was a problem with locking.")
 
 
-def resolve_deps(
+def process_deps(
     deps,
     which,
     project,
@@ -476,6 +477,7 @@ def resolve_deps(
     clear=False,
     pre=False,
     allow_global=False,
+    process='resolve',
     req_dir=None
 ):
     """Given a list of dependencies, return a resolved list of dependencies,
@@ -512,6 +514,7 @@ def resolve_deps(
                 sources,
                 clear,
                 pre,
+                process=process,
                 req_dir=req_dir,
             )
         except RuntimeError:
@@ -534,6 +537,7 @@ def resolve_deps(
                     sources,
                     clear,
                     pre,
+                    process=process,
                     req_dir=req_dir,
                 )
             except RuntimeError:
