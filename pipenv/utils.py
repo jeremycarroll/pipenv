@@ -296,9 +296,8 @@ class Resolver(object):
             dir=self.req_dir,
             delete=False,
         )
-        if self.sources:
-            requirementstxt_sources = " ".join(self.pip_args) if self.pip_args else ""
-            requirementstxt_sources = requirementstxt_sources.replace(" --", "\n--")
+        requirementstxt_sources = " ".join(self.pip_args) if self.pip_args else ""
+        requirementstxt_sources = requirementstxt_sources.replace(" --", "\n--")
         constraints_file.write(u"{0}\n".format(requirementstxt_sources))
         constraints = self.initial_constraints
         constraints_file.write(u"\n".join([c for c in constraints]))
@@ -450,7 +449,7 @@ def actually_resolve_deps(
     resolved_tree = resolver.resolve()
     hashes = resolver.resolve_hashes()
 
-    return (resolved_tree, hashes, markers_lookup, resolver)
+    return resolved_tree, hashes, markers_lookup, resolver
 
 
 @contextlib.contextmanager
@@ -557,7 +556,7 @@ def resolve_deps(
     deps,
     which,
     project,
-    sources=None,
+    sources,
     python=False,
     clear=False,
     pre=False,
@@ -572,6 +571,9 @@ def resolve_deps(
 
     index_lookup = {}
     markers_lookup = {}
+    # Note: all callers have which() giving the value sys.executable
+    # so that python_path and backup_python_path are identical, at the time of
+    # this comment.
     python_path = which("python", allow_global=allow_global)
     if not os.environ.get("PIP_SRC"):
         os.environ["PIP_SRC"] = project.virtualenv_src_location
