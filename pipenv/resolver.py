@@ -1,3 +1,5 @@
+"""Interal CLI for invoking pip to resolve dependencies"""
+
 import os
 import sys
 import json
@@ -40,7 +42,7 @@ class ResolverCli(object):
         parser.add_argument("--clear", action="store_true", default=False)
         parser.add_argument("--verbose", "-v", action="count", default=False)
         parser.add_argument("--debug", action="store_true", default=False)
-        parser.add_argument("--system", action="store_true", default=False)
+        parser.add_argument("--system", action="store_true", dest='allow_global', default=False)
         parser.add_argument("--requirements-dir", metavar="requirements_dir", action="store",
                             default=os.environ.get("PIPENV_REQ_DIR"))
         parser.add_argument("packages", nargs="*")
@@ -93,17 +95,8 @@ class ResolverCli(object):
             return self.project.pipfile_sources
 
     def run(self, sources):
-        from pipenv.utils import resolve_deps
-        results = resolve_deps(
-                self.parsed.packages,
-                which,
-                project=self.project,
-                pre=self.parsed.pre,
-                sources=sources,
-                clear=self.parsed.clear,
-                allow_global=self.parsed.system,
-                req_dir=self.parsed.requirements_dir
-            )
+        from pipenv.utils import ResolverWrapper
+        results = ResolverWrapper(self.parsed, self.project, sources).run(which)
         print("RESULTS:")
         if results:
             print(json.dumps(results))

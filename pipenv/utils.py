@@ -202,30 +202,6 @@ def prepare_pip_source_args(sources, pip_args=None):
     return pip_args
 
 
-def get_resolver_metadata(deps, index_lookup, markers_lookup, project, sources):
-    from .vendor.requirementslib.models.requirements import Requirement
-    constraints = []
-    for dep in deps:
-        if not dep:
-            continue
-        url = None
-        indexes, trusted_hosts, remainder = parse_indexes(dep)
-        if indexes:
-            url = indexes[0]
-        dep = " ".join(remainder)
-        req = Requirement.from_line(dep)
-        constraints.append(req.constraint_line)
-
-        if url:
-            index_lookup[req.name] = project.get_source(url=url).get("name")
-        # strip the marker and re-add it later after resolution
-        # but we will need a fallback in case resolution fails
-        # eg pypiwin32
-        if req.markers:
-            markers_lookup[req.name] = req.markers.replace('"', "'")
-    return constraints
-
-
 class Resolver(object):
     def __init__(self, constraints, req_dir, project, sources, clear=False, pre=False):
         from pipenv.patched.piptools import logging as piptools_logging
@@ -260,13 +236,13 @@ class Resolver(object):
 
     def _get_pip_command(self):
         from pip_shims.shims import Command
+        from pipenv.patched.piptools.scripts.compile import get_pip_command
 
         class PipCommand(Command):
             """Needed for pip-tools."""
 
             name = "PipCommand"
 
-        from pipenv.patched.piptools.scripts.compile import get_pip_command
         return get_pip_command()
 
     @property
@@ -428,30 +404,6 @@ class Resolver(object):
             return self.hashes
 
 
-def actually_resolve_deps(
-    deps,
-    index_lookup,
-    markers_lookup,
-    project,
-    sources,
-    clear,
-    pre,
-    req_dir=None,
-):
-    from pipenv.vendor.vistir.path import create_tracked_tempdir
-
-    if not req_dir:
-        req_dir = create_tracked_tempdir(suffix="-requirements", prefix="pipenv-")
-    constraints = get_resolver_metadata(
-        deps, index_lookup, markers_lookup, project, sources,
-    )
-    resolver = Resolver(constraints, req_dir, project, sources, clear=clear, pre=pre)
-    resolved_tree = resolver.resolve()
-    hashes = resolver.resolve_hashes()
-
-    return resolved_tree, hashes, markers_lookup, resolver
-
-
 @contextlib.contextmanager
 def create_spinner(text, nospin=None, spinner_name=None):
     import vistir.spin
@@ -552,134 +504,159 @@ def venv_resolve_deps(
         raise RuntimeError("There was a problem with locking.")
 
 
-def resolve_deps(
-    deps,
-    which,
-    project,
-    sources,
-    python=False,
-    clear=False,
-    pre=False,
-    allow_global=False,
-    req_dir=None
-):
-    """Given a list of dependencies, return a resolved list of dependencies,
-    using pip-tools -- and their hashes, using the warehouse API / pip.
-    """
-    from .vendor.requests.exceptions import ConnectionError
-    from .vendor.requirementslib.models.requirements import Requirement
+class ResolverWrapper(object):
+    RESOLVER_CLASS = Resolver
+    def __init__(self, config, project, sources):
+        """:param config: has fields
 
-    index_lookup = {}
-    markers_lookup = {}
-    # Note: all callers have which() giving the value sys.executable
-    # so that python_path and backup_python_path are identical, at the time of
-    # this comment.
-    python_path = which("python", allow_global=allow_global)
-    if not os.environ.get("PIP_SRC"):
-        os.environ["PIP_SRC"] = project.virtualenv_src_location
-    backup_python_path = sys.executable
-    results = []
-    if not deps:
-        return results
-    # First (proper) attempt:
-    req_dir = req_dir if req_dir else os.environ.get("req_dir", None)
-    if not req_dir:
-        from .vendor.vistir.path import create_tracked_tempdir
-        req_dir = create_tracked_tempdir(prefix="pipenv-", suffix="-requirements")
-    with HackedPythonVersion(python_version=python, python_path=python_path):
-        try:
-            resolved_tree, hashes, markers_lookup, resolver = actually_resolve_deps(
-                deps,
-                index_lookup,
-                markers_lookup,
-                project,
-                sources,
-                clear,
-                pre,
-                req_dir=req_dir,
-            )
-        except RuntimeError:
-            # Don't exit here, like usual.
-            resolved_tree = None
-    # Second (last-resort) attempt:
-    if resolved_tree is None:
-        with HackedPythonVersion(
-            python_version=".".join([str(s) for s in sys.version_info[:3]]),
-            python_path=backup_python_path,
-        ):
-            try:
-                # Attempt to resolve again, with different Python version information,
-                # particularly for particularly particular packages.
-                resolved_tree, hashes, markers_lookup, resolver = actually_resolve_deps(
-                    deps,
-                    index_lookup,
-                    markers_lookup,
-                    project,
-                    sources,
-                    clear,
-                    pre,
-                    req_dir=req_dir,
-                )
-            except RuntimeError:
-                sys.exit(1)
-    for result in resolved_tree:
-        if not result.editable:
-            req = Requirement.from_ireq(result)
-            name = pep423_name(req.name)
-            version = str(req.get_version())
-            index = index_lookup.get(result.name)
-            req.index = index
-            collected_hashes = []
-            if result in hashes:
-                collected_hashes = list(hashes.get(result))
-            elif any(
-                "python.org" in source["url"] or "pypi.org" in source["url"]
-                for source in sources
-            ):
-                pkg_url = "https://pypi.org/pypi/{0}/json".format(name)
-                session = _get_requests_session()
+        requirements_dir       A folder
+        packages               A list of dependencies to resolve.
+
+
+        and the following boolean fields:
+
+        pre
+        clear
+        allow_global
+
+        """
+        from pipenv.vendor.vistir.path import create_tracked_tempdir
+        self.config = config
+        req_dir = config.requirements_dir
+        req_dir = req_dir if req_dir else os.environ.get("req_dir", None)
+        if not req_dir:
+            req_dir = create_tracked_tempdir(suffix="-requirements", prefix="pipenv-")
+
+        self.project = project
+        self.sources = sources
+        self.index_lookup = {}
+        self.markers_lookup = {}
+        self.req_dir = req_dir
+
+    @property
+    def dependencies(self):
+        return self.config.packages
+
+    def get_resolver_metadata(self):
+        from .vendor.requirementslib.models.requirements import Requirement
+        constraints = []
+        for dep in self.dependencies:
+            if not dep:
+                continue
+            url = None
+            indexes, trusted_hosts, remainder = parse_indexes(dep)
+            if indexes:
+                url = indexes[0]
+            dep = " ".join(remainder)
+            req = Requirement.from_line(dep)
+            constraints.append(req.constraint_line)
+
+            if url:
+                self.index_lookup[req.name] = self.project.get_source(url=url).get("name")
+            # strip the marker and re-add it later after resolution
+            # but we will need a fallback in case resolution fails
+            # eg pypiwin32
+            if req.markers:
+                self.markers_lookup[req.name] = req.markers.replace('"', "'")
+
+        return constraints
+    
+    def run(self,  which):
+        """Given a list of dependencies, return a resolved list of dependencies,
+        using pip-tools -- and their hashes, using the warehouse API / pip.
+        """
+        # Note: all callers have which() giving the value sys.executable
+        # so that python_path and backup_python_path are identical, at the time of
+        # this comment.
+        python_path = which("python", allow_global=self.config.allow_global)
+        if not os.environ.get("PIP_SRC"):
+            os.environ["PIP_SRC"] = self.project.virtualenv_src_location
+        backup_python_path = sys.executable
+        results = []
+        if not self.dependencies:
+            return results
+        # First (proper) attempt:
+
+        resolved_tree, hashes = self.invoke_with_robust_python_versions(
+            (None, python_path),
+            (".".join([str(s) for s in sys.version_info[:3]]), backup_python_path) )
+
+        return self.select_results(resolved_tree, hashes)
+
+    def invoke_resolver(self):
+        constraints = self.get_resolver_metadata()
+        resolver = self.RESOLVER_CLASS(constraints, self.req_dir, self.project, self.sources,
+                                       clear=self.config.clear, pre=self.config.pre)
+        resolved_tree = resolver.resolve()
+        hashes = resolver.resolve_hashes()
+
+        return resolved_tree, hashes
+
+    def invoke_with_robust_python_versions(self, *python_info):
+        for python, python_path in python_info:
+            with HackedPythonVersion(python_version=python, python_path=python_path):
                 try:
-                    # Grab the hashes from the new warehouse API.
-                    r = session.get(pkg_url, timeout=10)
-                    api_releases = r.json()["releases"]
-                    cleaned_releases = {}
-                    for api_version, api_info in api_releases.items():
-                        api_version = clean_pkg_version(api_version)
-                        cleaned_releases[api_version] = api_info
-                    for release in cleaned_releases[version]:
-                        collected_hashes.append(release["digests"]["sha256"])
-                    collected_hashes = ["sha256:" + s for s in collected_hashes]
-                except (ValueError, KeyError, ConnectionError):
-                    if environments.is_verbose():
-                        click_echo(
-                            "{0}: Error generating hash for {1}".format(
-                                crayons.red("Warning", bold=True), name
-                            ), err=True
-                        )
-            # # Collect un-collectable hashes (should work with devpi).
-            # try:
-            #     collected_hashes = collected_hashes + list(
-            #         list(resolver.resolve_hashes([result]).items())[0][1]
-            #     )
-            # except (ValueError, KeyError, ConnectionError, IndexError):
-            #     if verbose:
-            #         print('Error generating hash for {}'.format(name))
-            req.hashes = sorted(set(collected_hashes))
-            name, _entry = req.pipfile_entry
-            entry = {}
-            if isinstance(_entry, six.string_types):
-                entry["version"] = _entry.lstrip("=")
-            else:
-                entry.update(_entry)
-                entry["version"] = version
-            entry["name"] = name
-            # if index:
-            #     d.update({"index": index})
-            if markers_lookup.get(result.name):
-                entry.update({"markers": markers_lookup.get(result.name)})
-            entry = translate_markers(entry)
-            results.append(entry)
-    return results
+                    return self.invoke_resolver()
+                except RuntimeError:
+                    # Try next python version
+                    pass
+        # None worked.
+        sys.exit(1)
+
+    def select_results(self, resolved_tree, hashes):
+        from .vendor.requirementslib.models.requirements import Requirement
+        from .vendor.requests.exceptions import ConnectionError
+        results = []
+        for result in resolved_tree:
+            if not result.editable:
+                req = Requirement.from_ireq(result)
+                name = pep423_name(req.name)
+                version = str(req.get_version())
+                index = self.index_lookup.get(result.name)
+                req.index = index
+                collected_hashes = []
+                if result in hashes:
+                    collected_hashes = list(hashes.get(result))
+                elif any(
+                    "python.org" in source["url"] or "pypi.org" in source["url"]
+                    for source in self.sources
+                ):
+                    pkg_url = "https://pypi.org/pypi/{0}/json".format(name)
+                    session = _get_requests_session()
+                    try:
+                        # Grab the hashes from the new warehouse API.
+                        r = session.get(pkg_url, timeout=10)
+                        api_releases = r.json()["releases"]
+                        cleaned_releases = {}
+                        for api_version, api_info in api_releases.items():
+                            api_version = clean_pkg_version(api_version)
+                            cleaned_releases[api_version] = api_info
+                        for release in cleaned_releases[version]:
+                            collected_hashes.append(release["digests"]["sha256"])
+                        collected_hashes = ["sha256:" + s for s in collected_hashes]
+                    except (ValueError, KeyError, ConnectionError):
+                        if environments.is_verbose():
+                            click_echo(
+                                "{0}: Error generating hash for {1}".format(
+                                    crayons.red("Warning", bold=True), name
+                                ), err=True
+                            )
+                req.hashes = sorted(set(collected_hashes))
+                name, _entry = req.pipfile_entry
+                entry = {}
+                if isinstance(_entry, six.string_types):
+                    entry["version"] = _entry.lstrip("=")
+                else:
+                    entry.update(_entry)
+                    entry["version"] = version
+                entry["name"] = name
+                # if index:
+                #     d.update({"index": index})
+                if self.markers_lookup.get(result.name):
+                    entry.update({"markers": self.markers_lookup.get(result.name)})
+                entry = translate_markers(entry)
+                results.append(entry)
+        return results
 
 
 def multi_split(s, split):
